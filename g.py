@@ -11,6 +11,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
 import aiosqlite
 
 # ================= CONFIGURATION =================
@@ -19,7 +20,7 @@ ADMIN_ID = 8626080388
 BOT_USERNAME = "Leongiveawaybot"
 CHANNEL_USERNAME = "@sterniterspro"
 CHANNEL_LINK = "https://t.me/sterniterspro"
-DB_NAME = "leon_giveaway.db"
+DB_NAME = "leon_giveaway_v2.db"
 # =================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -27,13 +28,14 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # --- FSM STATES (ADMIN ONLY) ---
-class CreateGiveaway(StatesGroup):
+class CreateGW(StatesGroup):
     title = State()
     prize = State()
+    points_per_ref = State()
     start_time = State()
     end_time = State()
 
-class EditGiveaway(StatesGroup):
+class EditGW(StatesGroup):
     new_value = State()
 
 class BroadcastState(StatesGroup):
@@ -47,9 +49,6 @@ async def init_db():
                 user_id INTEGER PRIMARY KEY,
                 full_name TEXT,
                 username TEXT,
-                referrer_id INTEGER,
-                points INTEGER DEFAULT 0,
-                referrals_count INTEGER DEFAULT 0,
                 is_member INTEGER DEFAULT 0
             )
         """)
@@ -58,9 +57,21 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT,
                 prize TEXT,
+                points_per_ref INTEGER DEFAULT 1,
                 start_time TEXT,
                 end_time TEXT,
                 is_active INTEGER DEFAULT 1
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS participants (
+                giveaway_id INTEGER,
+                user_id INTEGER,
+                referrer_id INTEGER,
+                points INTEGER DEFAULT 0,
+                referrals_count INTEGER DEFAULT 0,
+                rewarded INTEGER DEFAULT 0,
+                PRIMARY KEY (giveaway_id, user_id)
             )
         """)
         await db.commit()
@@ -73,309 +84,432 @@ async def check_membership(user_id: int) -> bool:
     except Exception:
         return False
 
-async def get_active_giveaway():
+async def safe_edit(message: Message, text: str, reply_markup: InlineKeyboardMarkup = None):
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+
+async def get_active_giveaways():
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
-            "SELECT id, title, prize, start_time, end_time FROM giveaways WHERE is_active = 1 ORDER BY id DESC LIMIT 1"
+            "SELECT id, title, prize, points_per_ref, start_time, end_time FROM giveaways WHERE is_active = 1 ORDER BY id DESC"
+        ) as cursor:
+            return await cursor.fetchall()
+
+async def get_giveaway(gw_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT id, title, prize, points_per_ref, start_time, end_time, is_active FROM giveaways WHERE id = ?",
+            (gw_id,)
         ) as cursor:
             return await cursor.fetchone()
 
-async def get_user_stats(user_id: int):
+async def ensure_participant(gw_id: int, user_id: int, referrer_id: int = None):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT user_id FROM participants WHERE giveaway_id = ? AND user_id = ?",
+            (gw_id, user_id)
+        ) as cursor:
+            exists = await cursor.fetchone()
+        if not exists:
+            await db.execute(
+                "INSERT INTO participants (giveaway_id, user_id, referrer_id, points, referrals_count, rewarded) VALUES (?, ?, ?, 0, 0, 0)",
+                (gw_id, user_id, referrer_id)
+            )
+            await db.commit()
+
+async def get_participant_stats(gw_id: int, user_id: int):
+    await ensure_participant(gw_id, user_id)
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
             """
-            SELECT points, referrals_count,
-            (SELECT COUNT(*) + 1 FROM users u2 WHERE u2.is_member = 1 AND u2.points > u1.points) as rank
-            FROM users u1 WHERE user_id = ?
+            SELECT p1.points, p1.referrals_count,
+            (SELECT COUNT(*) + 1 FROM participants p2 
+             JOIN users u ON p2.user_id = u.user_id
+             WHERE p2.giveaway_id = p1.giveaway_id AND u.is_member = 1 AND p2.points > p1.points) as rank
+            FROM participants p1 WHERE p1.giveaway_id = ? AND p1.user_id = ?
+            """,
+            (gw_id, user_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return (row[0], row[1], row[2]) if row else (0, 0, 1)
+
+async def process_verified_rewards(user_id: int, full_name: str, username: str):
+    """Jab user channel join kar leta hai, to uske aur uske referrer ke points add karta hai."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE users SET is_member = 1, full_name = ?, username = ? WHERE user_id = ?",
+            (full_name, username, user_id)
+        )
+        # Check all active giveaways where this user was referred and not yet rewarded
+        async with db.execute(
+            """
+            SELECT p.giveaway_id, p.referrer_id, g.title, g.points_per_ref
+            FROM participants p
+            JOIN giveaways g ON p.giveaway_id = g.id
+            WHERE p.user_id = ? AND p.rewarded = 0 AND g.is_active = 1
             """,
             (user_id,)
         ) as cursor:
-            row = await cursor.fetchone()
-            return (row[0], row[1], row[2]) if row else (0, 0, "N/A")
+            pending_rows = await cursor.fetchall()
 
-async def sync_and_reward_user(user_id: int, full_name: str, username: str):
-    """Dono user aur uske dost ko +1 point deta hai jab channel join hota hai."""
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT referrer_id, is_member FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            user = await cursor.fetchone()
-
-        if user and user[1] == 0:
-            referrer_id = user[0]
-            await db.execute(
-                "UPDATE users SET points = points + 1, is_member = 1, full_name = ?, username = ? WHERE user_id = ?",
-                (full_name, username, user_id)
-            )
-            if referrer_id:
+        for gw_id, ref_id, gw_title, pts_per_ref in pending_rows:
+            if ref_id:
+                await ensure_participant(gw_id, ref_id)
+                # Dono user aur dost ko points milenge
                 await db.execute(
-                    "UPDATE users SET points = points + 1, referrals_count = referrals_count + 1 WHERE user_id = ?",
-                    (referrer_id,)
+                    "UPDATE participants SET points = points + ?, rewarded = 1 WHERE giveaway_id = ? AND user_id = ?",
+                    (pts_per_ref, gw_id, user_id)
+                )
+                await db.execute(
+                    "UPDATE participants SET points = points + ?, referrals_count = referrals_count + 1 WHERE giveaway_id = ? AND user_id = ?",
+                    (pts_per_ref, gw_id, ref_id)
                 )
                 try:
                     await bot.send_message(
-                        referrer_id,
-                        f"🎉 <b>NEW REFERRAL JOINED!</b>\n\n"
+                        ref_id,
+                        f"🎉 <b>NEW REFERRAL VERIFIED!</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🎁 <b>Giveaway:</b> {html.escape(gw_title)}\n"
                         f"👤 <b>Friend:</b> {html.escape(full_name)}\n"
-                        f"✅ Unhone <b>{CHANNEL_USERNAME}</b> join kar liya hai.\n"
-                        f"➕ <b>Reward:</b> Aapko aur aapke dost dono ko <code>+1 Point</code> mil gaya hai!",
+                        f"✨ <b>Bonus Added:</b> <code>+{pts_per_ref} Points</code>",
                         parse_mode="HTML"
                     )
                 except Exception:
                     pass
-            await db.commit()
+            else:
+                await db.execute(
+                    "UPDATE participants SET rewarded = 1 WHERE giveaway_id = ? AND user_id = ?",
+                    (gw_id, user_id)
+                )
+        await db.commit()
 
 async def handle_unsubscribed_user(user_id: int):
-    """Channel leave karne par dono user aur referrer ka -1 point kat deta hai."""
+    """Channel leave karne par user aur uske referrer dono ke points deduct karta hai."""
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT referrer_id, is_member, full_name FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
+        async with db.execute("SELECT is_member, full_name FROM users WHERE user_id = ?", (user_id,)) as c_u:
+            u_row = await c_u.fetchone()
+        if not u_row or u_row[0] == 0:
+            return
 
-        if row and row[1] == 1:
-            referrer_id, _, full_name = row
-            await db.execute(
-                "UPDATE users SET points = MAX(0, points - 1), is_member = 0 WHERE user_id = ?",
-                (user_id,)
-            )
-            if referrer_id:
+        full_name = u_row[1] or str(user_id)
+        await db.execute("UPDATE users SET is_member = 0 WHERE user_id = ?", (user_id,))
+
+        async with db.execute(
+            """
+            SELECT p.giveaway_id, p.referrer_id, g.title, g.points_per_ref
+            FROM participants p
+            JOIN giveaways g ON p.giveaway_id = g.id
+            WHERE p.user_id = ? AND p.rewarded = 1 AND g.is_active = 1
+            """,
+            (user_id,)
+        ) as cursor:
+            rewarded_rows = await cursor.fetchall()
+
+        for gw_id, ref_id, gw_title, pts_per_ref in rewarded_rows:
+            if ref_id:
                 await db.execute(
-                    "UPDATE users SET points = MAX(0, points - 1), referrals_count = MAX(0, referrals_count - 1) WHERE user_id = ?",
-                    (referrer_id,)
+                    "UPDATE participants SET points = MAX(0, points - ?), rewarded = 0 WHERE giveaway_id = ? AND user_id = ?",
+                    (pts_per_ref, gw_id, user_id)
+                )
+                await db.execute(
+                    "UPDATE participants SET points = MAX(0, points - ?), referrals_count = MAX(0, referrals_count - 1) WHERE giveaway_id = ? AND user_id = ?",
+                    (pts_per_ref, gw_id, ref_id)
                 )
                 try:
                     await bot.send_message(
-                        referrer_id,
-                        f"⚠️ <b>REFERRAL UNSUBSCRIBED!</b>\n\n"
-                        f"👤 <b>Friend:</b> {html.escape(full_name or str(user_id))}\n"
-                        f"➖ Unhone <b>{CHANNEL_USERNAME}</b> leave kar diya hai, isliye aapka aur unka <code>-1 Point</code> kat gaya hai!",
+                        ref_id,
+                        f"⚠️ <b>REFERRAL LEFT CHANNEL!</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🎁 <b>Giveaway:</b> {html.escape(gw_title)}\n"
+                        f"👤 <b>Friend:</b> {html.escape(full_name)}\n"
+                        f"➖ <b>Penalty:</b> Unhone <b>{CHANNEL_USERNAME}</b> leave kar diya, isliye aap dono ke <code>-{pts_per_ref} Points</code> kat gaye hain!",
                         parse_mode="HTML"
                     )
                 except Exception:
                     pass
-            await db.commit()
+            else:
+                await db.execute(
+                    "UPDATE participants SET rewarded = 0 WHERE giveaway_id = ? AND user_id = ?",
+                    (gw_id, user_id)
+                )
+        await db.commit()
 
-# --- KEYBOARDS (EASY & BOLD UI) ---
-def force_join_kb():
+# ================= UI KEYBOARDS =================
+def force_join_kb(target_gw_id: int = 0):
+    cb_data = f"verify_join_{target_gw_id}"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Join @sterniterspro Channel", url=CHANNEL_LINK)],
-        [InlineKeyboardButton(text="✅ Joined! Unlock Bot (+1 Point)", callback_data="verify_join")]
+        [InlineKeyboardButton(text="✅ Joined! Unlock Bot", callback_data=cb_data)]
     ])
 
-def user_home_kb(user_id: int):
-    ref_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
+def home_giveaways_kb(giveaways, user_id: int):
+    buttons = []
+    # Har running giveaway ek clean button ke roop me dikhega
+    for gw in giveaways:
+        gw_id, title, prize, pts_per_ref, _, _ = gw
+        btn_text = f"🎁 {title}  •  🏆 {prize}"
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"opengw_{gw_id}")])
+
+    buttons.append([InlineKeyboardButton(text="🔄 Refresh Running Giveaways", callback_data="home_menu")])
+    if user_id == ADMIN_ID:
+        buttons.append([InlineKeyboardButton(text="🛠 Admin Control Panel", callback_data="admin_home")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def single_giveaway_kb(gw_id: int, gw_title: str, prize: str, pts_per_ref: int, user_id: int):
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=gw{gw_id}_{user_id}"
     share_text = urllib.parse.quote(
-        f"🔥 Mega Giveaway chal raha hai {CHANNEL_USERNAME} par!\n\n"
-        f"🎁 Mere link se bot start karke channel join karo, hum dono ko +1 Point milega:\n{ref_link}"
+        f"🔥 {gw_title} is LIVE on {CHANNEL_USERNAME}!\n"
+        f"🏆 Winning Prize: {prize}\n\n"
+        f"🎁 Mere link se join karo, hum dono ko +{pts_per_ref} Points milenge:\n{ref_link}"
     )
     share_url = f"https://t.me/share/url?url={urllib.parse.quote(ref_link)}&text={share_text}"
 
-    buttons = [
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Share Referral Link With Friends", url=share_url)],
-        [InlineKeyboardButton(text="🏆 Check Leaderboard", callback_data="view_leaderboard"),
-         InlineKeyboardButton(text="🔄 Refresh Status", callback_data="refresh_home")]
-    ]
-    # Sirf Admin ko Admin Panel button dikhega
-    if user_id == ADMIN_ID:
-        buttons.append([InlineKeyboardButton(text="🛠 Admin Control Panel (Admin Only)", callback_data="admin_home")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+        [InlineKeyboardButton(text="🏆 Leaderboard", callback_data=f"gwlead_{gw_id}"),
+         InlineKeyboardButton(text="🔄 Refresh Stats", callback_data=f"opengw_{gw_id}")],
+        [InlineKeyboardButton(text="🔙 Back to All Giveaways", callback_data="home_menu")]
+    ])
 
-def leaderboard_kb():
+def gw_leaderboard_kb(gw_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Refresh Leaderboard", callback_data="view_leaderboard")],
-        [InlineKeyboardButton(text="⬅️ Back to Giveaway & Referral", callback_data="refresh_home")]
+        [InlineKeyboardButton(text="🔄 Refresh Leaderboard", callback_data=f"gwlead_{gw_id}")],
+        [InlineKeyboardButton(text="🔙 Back to Giveaway Details", callback_data=f"opengw_{gw_id}")]
     ])
 
-def admin_panel_kb(has_active_gw: bool):
-    buttons = [
-        [InlineKeyboardButton(text="➕ Create New Giveaway", callback_data="admin_create")]
-    ]
-    if has_active_gw:
-        buttons.extend([
-            [InlineKeyboardButton(text="✏️ Edit Running Giveaway (Time / Prize)", callback_data="admin_edit_menu")],
-            [InlineKeyboardButton(text="👑 Check Winner", callback_data="admin_winner"),
-             InlineKeyboardButton(text="🗑 Delete Giveaway", callback_data="admin_delete")]
-        ])
-    buttons.extend([
-        [InlineKeyboardButton(text="📊 Live Bot Stats", callback_data="admin_stats"),
-         InlineKeyboardButton(text="🔄 Reset All Points", callback_data="admin_reset_pts")],
-        [InlineKeyboardButton(text="📢 Broadcast Message", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="⬅️ Back to User View", callback_data="refresh_home")]
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+# ================= USER SCREENS =================
+async def render_home_screen(target, user_id: int, full_name: str, is_edit: bool = True):
+    giveaways = await get_active_giveaways()
+    gw_count = len(giveaways)
 
-def edit_giveaway_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔴 Edit End Time (Extend/Reduce)", callback_data="editfield_end_time")],
-        [InlineKeyboardButton(text="🟢 Edit Start Time", callback_data="editfield_start_time")],
-        [InlineKeyboardButton(text="💎 Edit Prize", callback_data="editfield_prize"),
-         InlineKeyboardButton(text="🏷 Edit Title", callback_data="editfield_title")],
-        [InlineKeyboardButton(text="⬅️ Back to Admin Panel", callback_data="admin_home")]
-    ])
-
-# --- HOME SCREEN BUILDER (SHOWS GIVEAWAY + REFERRAL DIRECTLY) ---
-async def send_home_dashboard(target, user_id: int, full_name: str, is_edit: bool = True):
-    gw = await get_active_giveaway()
-    pts, refs, rank = await get_user_stats(user_id)
-    ref_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
-
-    if gw:
-        gw_box = (
-            f"🎁 <b>CURRENT RUNNING GIVEAWAY</b> 🎁\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏷 <b>Giveaway:</b> <b>{html.escape(gw[1])}</b>\n"
-            f"💎 <b>Winning Prize:</b> <b>{html.escape(gw[2])}</b>\n"
-            f"🟢 <b>Start Time:</b> <code>{html.escape(gw[3])}</code>\n"
-            f"🔴 <b>End Time:</b> <code>{html.escape(gw[4])}</code>\n"
-            f"🏆 <b>Rule:</b> Sabse zyada referral karne wala <b>#1 Rank</b> user Winner banega!"
+    if gw_count > 0:
+        guide_box = (
+            f"🔥 <b>RUNNING GIVEAWAYS ({gw_count} ACTIVE)</b>\n"
+            f"<i>Neeche diye gaye Giveaway button par click karke uski details, apna Referral Link aur Leaderboard dekhein 👇</i>"
         )
     else:
-        gw_box = (
-            f"🎁 <b>GIVEAWAY STATUS</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Filhaal koi giveaway active nahi hai. Naye giveaway ke liye {CHANNEL_USERNAME} par jude rahein!</i>"
+        guide_box = (
+            f"💤 <b>NO RUNNING GIVEAWAY</b>\n"
+            f"<i>Filhaal koi giveaway active nahi hai. Naye updates ke liye {CHANNEL_USERNAME} par jude rahein!</i>"
         )
 
     text = (
-        f"👋 <b>Welcome, {html.escape(full_name)}!</b>\n\n"
-        f"<blockquote>{gw_box}</blockquote>\n\n"
-        f"📊 <b>YOUR LIVE STATS:</b>\n"
-        f"⭐ <b>Your Points:</b> <code>{pts} Points</code>\n"
-        f"👥 <b>Invited Friends:</b> <code>{refs} Referrals</code>\n"
-        f"🏅 <b>Leaderboard Rank:</b> <code>#{rank}</code>\n\n"
-        f"🔗 <b>YOUR REFERRAL LINK (Tap to Copy):</b>\n"
-        f"<code>{ref_link}</code>\n\n"
-        f"<blockquote>💡 <b>Kaise Kaam Karta Hai:</b>\n"
-        f"• Apna link doston ko bhejein. Jab dost bot start karke <b>{CHANNEL_USERNAME}</b> join karega, to <b>aapko +1 Point</b> aur <b>dost ko bhi +1 Point</b> milega.\n"
-        f"• Agar dost channel leave karega to dono ka <b>-1 Point</b> kat jayega!</blockquote>"
+        f"✨ <b>WELCOME TO GIVEAWAY HUB</b> ✨\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"╭ 👤 <b>User:</b> <b>{html.escape(full_name)}</b>\n"
+        f"├ 📢 <b>Channel:</b> {CHANNEL_USERNAME}\n"
+        f"╰ ✅ <b>Status:</b> <code>Verified Member</code>\n\n"
+        f"<blockquote>{guide_box}</blockquote>"
     )
-
+    kb = home_giveaways_kb(giveaways, user_id)
     if is_edit:
-        try:
-            await target.edit_text(text, reply_markup=user_home_kb(user_id), parse_mode="HTML")
-        except Exception:
-            pass
+        await safe_edit(target, text, reply_markup=kb)
     else:
-        await target.answer(text, reply_markup=user_home_kb(user_id), parse_mode="HTML")
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
-# --- /start COMMAND ---
+async def render_single_giveaway(target, gw_id: int, user_id: int, is_edit: bool = True):
+    gw = await get_giveaway(gw_id)
+    if not gw or gw[6] == 0:
+        text = "❌ <b>Yeh giveaway ab khatam ya बंद ho chuka hai!</b>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Home", callback_data="home_menu")]])
+        if is_edit:
+            await safe_edit(target, text, reply_markup=kb)
+        else:
+            await target.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    _, title, prize, pts_per_ref, start_t, end_t, _ = gw
+    pts, refs, rank = await get_participant_stats(gw_id, user_id)
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=gw{gw_id}_{user_id}"
+
+    text = (
+        f"🎁 <b>{html.escape(title.upper())}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"╭ 🏆 <b>Winning Prize:</b> <b>{html.escape(prize)}</b>\n"
+        f"├ ⭐ <b>Per Referral:</b> <code>+{pts_per_ref} Points</code>\n"
+        f"├ 🟢 <b>Start Time:</b> <code>{html.escape(start_t)}</code>\n"
+        f"╰ 🔴 <b>End Time:</b> <code>{html.escape(end_t)}</code>\n\n"
+        f"<blockquote>📊 <b>YOUR STATS IN THIS GIVEAWAY</b>\n"
+        f"╭ 🏅 <b>Your Rank:</b> <code>#{rank}</code>\n"
+        f"├ 💎 <b>Your Points:</b> <code>{pts} Points</code>\n"
+        f"╰ 👥 <b>Active Referrals:</b> <code>{refs} Friends</code></blockquote>\n\n"
+        f"🔗 <b>YOUR GIVEAWAY REFERRAL LINK:</b>\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"<i>💡 Tap link to copy! Jab aapka dost is link se bot start karke <b>{CHANNEL_USERNAME}</b> join karega, to aap dono ko <b>+{pts_per_ref} Points</b> milenge.</i>"
+    )
+    kb = single_giveaway_kb(gw_id, title, prize, pts_per_ref, user_id)
+    if is_edit:
+        await safe_edit(target, text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+
+# ================= /start & REFERRAL HANDLER =================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     user_id = message.from_user.id
     full_name = message.from_user.full_name or "User"
     username = message.from_user.username or ""
     args = message.text.split()
-    referrer_id = int(args[1]) if len(args) > 1 and args[1].isdigit() and int(args[1]) != user_id else None
+
+    target_gw_id = 0
+    referrer_id = None
+
+    # Parse clean giveaway referral link: ?start=gw1_8626080388
+    if len(args) > 1 and args[1].startswith("gw"):
+        try:
+            parts = args[1][2:].split("_")
+            parsed_gw = int(parts[0])
+            parsed_ref = int(parts[1])
+            if parsed_ref != user_id:
+                target_gw_id = parsed_gw
+                referrer_id = parsed_ref
+            else:
+                target_gw_id = parsed_gw
+        except Exception:
+            pass
 
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
             exists = await cursor.fetchone()
-
         if not exists:
             await db.execute(
-                "INSERT INTO users (user_id, full_name, username, referrer_id, points, referrals_count, is_member) VALUES (?, ?, ?, ?, 0, 0, 0)",
-                (user_id, full_name, username, referrer_id)
+                "INSERT INTO users (user_id, full_name, username, is_member) VALUES (?, ?, ?, 0)",
+                (user_id, full_name, username)
             )
-            await db.commit()
         else:
             await db.execute(
                 "UPDATE users SET full_name = ?, username = ? WHERE user_id = ?",
                 (full_name, username, user_id)
             )
-            await db.commit()
+        await db.commit()
+
+    if target_gw_id > 0:
+        gw = await get_giveaway(target_gw_id)
+        if gw and gw[6] == 1:
+            await ensure_participant(target_gw_id, user_id, referrer_id)
 
     if not await check_membership(user_id):
         await handle_unsubscribed_user(user_id)
         await message.answer(
-            f"🚫 <b>BOT LOCKED — JOIN CHANNEL FIRST!</b>\n\n"
-            f"Giveaway me participate karne aur bot use karne ke liye aapko humara main channel <b>{CHANNEL_USERNAME}</b> join karna zaroori hai.\n\n"
-            f"<blockquote>🎁 <b>Bonus:</b> Channel join karte hi aapko aur aapke referrer dost ko <b>+1 Point</b> turant mil jayega!</blockquote>",
-            reply_markup=force_join_kb(),
+            f"🔒 <b>ACCESS LOCKED — JOIN CHANNEL</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Bot aur Giveaway me participate karne ke liye aapko humara official channel <b>{CHANNEL_USERNAME}</b> join karna zaroori hai.\n\n"
+            f"<blockquote>✨ <b>Instant Bonus:</b> Channel join karke Verify dabayein, aapko aur aapke dost dono ko turant Referral Points mil jayenge!</blockquote>",
+            reply_markup=force_join_kb(target_gw_id),
             parse_mode="HTML"
         )
         return
 
-    await sync_and_reward_user(user_id, full_name, username)
-    await send_home_dashboard(message, user_id, full_name, is_edit=False)
+    await process_verified_rewards(user_id, full_name, username)
+    if target_gw_id > 0:
+        await render_single_giveaway(message, target_gw_id, user_id, is_edit=False)
+    else:
+        await render_home_screen(message, user_id, full_name, is_edit=False)
 
-# --- VERIFY MEMBERSHIP & REFRESH HOME ---
-@dp.callback_query(F.data == "verify_join")
+# --- VERIFY & NAVIGATION CALLBACKS ---
+@dp.callback_query(F.data.startswith("verify_join_"))
 async def cb_verify_join(callback: CallbackQuery):
     user_id = callback.from_user.id
+    target_gw_id = int(callback.data.split("_")[-1])
+
     if await check_membership(user_id):
-        await sync_and_reward_user(user_id, callback.from_user.full_name, callback.from_user.username or "")
-        await callback.answer("✅ Channel Joined! +1 Point Activated.", show_alert=True)
-        await send_home_dashboard(callback.message, user_id, callback.from_user.full_name, is_edit=True)
+        await process_verified_rewards(user_id, callback.from_user.full_name, callback.from_user.username or "")
+        await callback.answer("✅ Verified! Welcome to the Giveaway.", show_alert=True)
+        if target_gw_id > 0:
+            await render_single_giveaway(callback.message, target_gw_id, user_id, is_edit=True)
+        else:
+            await render_home_screen(callback.message, user_id, callback.from_user.full_name, is_edit=True)
     else:
         await handle_unsubscribed_user(user_id)
-        await callback.answer("❌ Aapne abhi tak @sterniterspro join nahi kiya hai! Pehle join karein.", show_alert=True)
+        await callback.answer("❌ Aapne abhi tak @sterniterspro join nahi kiya hai!", show_alert=True)
 
-@dp.callback_query(F.data == "refresh_home")
-async def cb_refresh_home(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "home_menu")
+async def cb_home_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     user_id = callback.from_user.id
     if not await check_membership(user_id):
         await handle_unsubscribed_user(user_id)
-        await callback.answer("⚠️ Aapne channel leave kar diya hai! Points kat gaye hain.", show_alert=True)
-        await callback.message.edit_text(
-            f"🚫 <b>ACCESS BLOCKED!</b>\n\n"
-            f"Aapne <b>{CHANNEL_USERNAME}</b> unsubscribe kar diya hai, isliye aapka aur aapke dost ka <code>-1 Point</code> kat gaya hai.\n\n"
-            f"Bot use karne ke liye wapas channel join karein:",
-            reply_markup=force_join_kb(),
-            parse_mode="HTML"
+        await callback.answer("⚠️ Pehle @sterniterspro join karein!", show_alert=True)
+        await safe_edit(
+            callback.message,
+            f"🚫 <b>CHANNEL UNSUBSCRIBED!</b>\n\nBot use karne ke liye wapas <b>{CHANNEL_USERNAME}</b> join karein:",
+            reply_markup=force_join_kb(0)
         )
         return
-    await callback.answer("🔄 Updated!")
-    await send_home_dashboard(callback.message, user_id, callback.from_user.full_name, is_edit=True)
+    await callback.answer()
+    await render_home_screen(callback.message, user_id, callback.from_user.full_name, is_edit=True)
 
-# --- LEADERBOARD FOR USERS ---
-@dp.callback_query(F.data == "view_leaderboard")
-async def cb_leaderboard(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("opengw_"))
+async def cb_open_giveaway(callback: CallbackQuery):
     user_id = callback.from_user.id
+    gw_id = int(callback.data.split("_")[1])
+
     if not await check_membership(user_id):
         await handle_unsubscribed_user(user_id)
-        await callback.answer("⚠️ Pehle @sterniterspro channel join karein!", show_alert=True)
-        await callback.message.edit_text(
-            f"🚫 <b>CHANNEL UNSUBSCRIBED!</b>\n\nBot use karne ke liye <b>{CHANNEL_USERNAME}</b> join karein:",
-            reply_markup=force_join_kb(),
-            parse_mode="HTML"
+        await callback.answer("⚠️ Aapne channel leave kar diya hai! Points deduct ho gaye hain.", show_alert=True)
+        await safe_edit(
+            callback.message,
+            f"🚫 <b>ACCESS LOCKED!</b>\n\nAapne <b>{CHANNEL_USERNAME}</b> leave kar diya hai. Points wapas paane ke liye channel join karein:",
+            reply_markup=force_join_kb(gw_id)
         )
         return
 
-    gw = await get_active_giveaway()
-    gw_name = html.escape(gw[1]) if gw else "Giveaway"
+    await callback.answer()
+    await render_single_giveaway(callback.message, gw_id, user_id, is_edit=True)
+
+@dp.callback_query(F.data.startswith("gwlead_"))
+async def cb_gw_leaderboard(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    gw_id = int(callback.data.split("_")[1])
+
+    if not await check_membership(user_id):
+        await handle_unsubscribed_user(user_id)
+        return await callback.answer("⚠️ Pehle @sterniterspro channel join karein!", show_alert=True)
+
+    gw = await get_giveaway(gw_id)
+    if not gw:
+        return await callback.answer("❌ Giveaway nahi mila!", show_alert=True)
 
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
-            "SELECT user_id, full_name, points, referrals_count FROM users WHERE is_member = 1 ORDER BY points DESC, referrals_count DESC LIMIT 10"
+            """
+            SELECT p.user_id, u.full_name, p.points, p.referrals_count
+            FROM participants p
+            JOIN users u ON p.user_id = u.user_id
+            WHERE p.giveaway_id = ? AND u.is_member = 1 AND p.points > 0
+            ORDER BY p.points DESC, p.referrals_count DESC LIMIT 10
+            """,
+            (gw_id,)
         ) as cursor:
-            top_users = await cursor.fetchall()
+            top_list = await cursor.fetchall()
 
-    pts, refs, rank = await get_user_stats(user_id)
+    pts, refs, rank = await get_participant_stats(gw_id, user_id)
 
-    if not top_users:
-        board_text = "<i>Abhi tak koi participant nahi hai. Sabse pehle refer karke #1 par aayein!</i>"
+    if not top_list:
+        board_str = "<i>Abhi tak kisi user ke points nahi hain. Sabse pehle refer karke #1 Rank par aayein!</i>"
     else:
         medals = ["🥇", "🥈", "🥉"]
         lines = []
-        for idx, (uid, name, u_pts, u_refs) in enumerate(top_users, start=1):
+        for idx, (uid, name, u_pts, u_refs) in enumerate(top_list, start=1):
             badge = medals[idx - 1] if idx <= 3 else f"<b>#{idx}</b>"
-            clean_name = html.escape((name or "User")[:18])
+            clean_name = html.escape((name or "User")[:16])
             you_tag = " <b>(YOU)</b>" if uid == user_id else ""
             lines.append(f"{badge} <b>{clean_name}</b>{you_tag} — <code>{u_pts} Pts</code> <i>({u_refs} Refs)</i>")
-        board_text = "\n".join(lines)
+        board_str = "\n".join(lines)
 
     text = (
-        f"🏆 <b>LIVE TOP 10 LEADERBOARD</b> 🏆\n"
-        f"🎁 <b>Event:</b> <b>{gw_name}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{board_text}\n\n"
-        f"<blockquote>👤 <b>Your Rank:</b> <code>#{rank}</code>  |  ⭐ <b>Points:</b> <code>{pts}</code>  |  👥 <b>Refs:</b> <code>{refs}</code></blockquote>"
+        f"🏆 <b>GIVEAWAY TOP 10 LEADERBOARD</b>\n"
+        f"🎁 <b>{html.escape(gw[1])}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{board_str}\n\n"
+        f"<blockquote>👤 <b>Your Position:</b> Rank <code>#{rank}</code>  |  💎 <b>{pts} Pts</b> ({refs} Refs)</blockquote>"
     )
     await callback.answer()
-    try:
-        await callback.message.edit_text(text, reply_markup=leaderboard_kb(), parse_mode="HTML")
-    except Exception:
-        pass
+    await safe_edit(callback.message, text, reply_markup=gw_leaderboard_kb(gw_id))
 
-# --- AUTO POINT DEDUCTION ON CHANNEL LEAVE ---
+# --- REAL-TIME AUTO POINT DEDUCTION ON CHANNEL LEAVE ---
 @dp.chat_member()
 async def on_channel_member_update(event: ChatMemberUpdated):
     if event.chat.username and f"@{event.chat.username.lower()}" == CHANNEL_USERNAME.lower():
@@ -386,211 +520,251 @@ async def on_channel_member_update(event: ChatMemberUpdated):
             try:
                 await bot.send_message(
                     user.id,
-                    f"⚠️ <b>CHANNEL UNSUBSCRIBED ALERT!</b>\n\n"
-                    f"Aapne <b>{CHANNEL_USERNAME}</b> leave kar diya hai! Isliye aapka aur aapke referrer ka <code>-1 Point</code> kat gaya hai aur bot बंद ho gaya hai.\n\n"
-                    f"Apna point wapas paane ke liye abhi rejoin karein:",
-                    reply_markup=force_join_kb(),
+                    f"⚠️ <b>CHANNEL UNSUBSCRIBED ALERT!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Aapne <b>{CHANNEL_USERNAME}</b> unsubscribe kar diya hai! Isliye aapke aur aapke dost ke Referral Points kat gaye hain.\n\n"
+                    f"👇 <b>Points wapas paane ke liye turant rejoin karein:</b>",
+                    reply_markup=force_join_kb(0),
                     parse_mode="HTML"
                 )
             except Exception:
                 pass
         elif new_status in ["member", "administrator", "creator"]:
-            await sync_and_reward_user(user.id, user.full_name, user.username or "")
+            await process_verified_rewards(user.id, user.full_name, user.username or "")
 
-# ==================== ADMIN PANEL (STRICTLY ADMIN ONLY) ====================
-async def render_admin_panel(target, is_edit: bool = True):
-    gw = await get_active_giveaway()
-    if gw:
-        gw_info = (
-            f"🟢 <b>CURRENT RUNNING GIVEAWAY (ID #{gw[0]})</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏷 <b>Title:</b> <b>{html.escape(gw[1])}</b>\n"
-            f"💎 <b>Prize:</b> <b>{html.escape(gw[2])}</b>\n"
-            f"🟢 <b>Start:</b> <code>{html.escape(gw[3])}</code>\n"
-            f"🔴 <b>End:</b> <code>{html.escape(gw[4])}</code>"
-        )
-    else:
-        gw_info = "🔴 <b>STATUS:</b> <i>Koi Giveaway Active Nahi Hai</i>"
+# ==================== ADMIN CONTROL PANEL ====================
+async def render_admin_home(target, is_edit: bool = True):
+    giveaways = await get_active_giveaways()
+    buttons = [
+        [InlineKeyboardButton(text="➕ Create New Giveaway", callback_data="admin_create")]
+    ]
+    # Har running giveaway admin panel me manage karne ke liye dikhega
+    for gw in giveaways:
+        gw_id, title, prize, pts_ref, _, _ = gw
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"⚙️ Manage: {title} (+{pts_ref} Pts/Ref)",
+                callback_data=f"admin_manage_{gw_id}"
+            )
+        ])
+
+    buttons.extend([
+        [InlineKeyboardButton(text="📊 Live Bot Stats", callback_data="admin_stats"),
+         InlineKeyboardButton(text="📢 Broadcast Message", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="🔙 Back to User View", callback_data="home_menu")]
+    ])
 
     text = (
-        f"🛠 <b>ADMIN CONTROL PANEL (ONLY FOR LEON)</b>\n\n"
-        f"<blockquote>{gw_info}</blockquote>\n\n"
-        f"👇 <b>Yahan se Giveaway Add, Edit, ya Delete karein:</b>"
+        f"🛠 <b>ADMIN CONTROL PANEL</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 <b>Active Giveaways:</b> <code>{len(giveaways)} Running</code>\n\n"
+        f"<blockquote>💡 <b>Admin Guide:</b>\n"
+        f"• Naya giveaway banane ke liye <b>➕ Create New Giveaway</b> dabayein.\n"
+        f"• Kisi running giveaway ka <b>Time, Prize, Referral Point</b> badalne ya <b>Winner/Delete</b> karne ke liye neeche us giveaway par click karein:</blockquote>"
     )
-    kb = admin_panel_kb(has_active_gw=bool(gw))
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if is_edit:
-        try:
-            await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
-        except Exception:
-            pass
+        await safe_edit(target, text, reply_markup=kb)
     else:
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
     if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ <b>Access Denied!</b> Yeh panel sirf Admin ke liye hai.", parse_mode="HTML")
         return
-    await render_admin_panel(message, is_edit=False)
+    await render_admin_home(message, is_edit=False)
 
 @dp.callback_query(F.data == "admin_home")
 async def cb_admin_home(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Access Denied!", show_alert=True)
     await state.clear()
-    await render_admin_panel(callback.message, is_edit=True)
+    await callback.answer()
+    await render_admin_home(callback.message, is_edit=True)
 
-# --- EDIT RUNNING GIVEAWAY (TIME / PRIZE / TITLE) ---
-@dp.callback_query(F.data == "admin_edit_menu")
-async def cb_admin_edit_menu(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return await callback.answer("❌ Access Denied!", show_alert=True)
+# --- MANAGE SPECIFIC RUNNING GIVEAWAY (EDIT / WINNER / DELETE) ---
+async def render_admin_manage_gw(target, gw_id: int, is_edit: bool = True):
+    gw = await get_giveaway(gw_id)
+    if not gw or gw[6] == 0:
+        return await render_admin_home(target, is_edit=is_edit)
 
-    gw = await get_active_giveaway()
-    if not gw:
-        return await callback.answer("❌ Koi active giveaway nahi hai!", show_alert=True)
-
+    _, title, prize, pts_per_ref, start_t, end_t, _ = gw
     text = (
-        f"✏️ <b>EDIT RUNNING GIVEAWAY</b>\n\n"
-        f"🏷 <b>Current Title:</b> {html.escape(gw[1])}\n"
-        f"💎 <b>Current Prize:</b> {html.escape(gw[2])}\n"
-        f"🟢 <b>Current Start Time:</b> <code>{html.escape(gw[3])}</code>\n"
-        f"🔴 <b>Current End Time:</b> <code>{html.escape(gw[4])}</code>\n\n"
-        f"👇 <b>Aap kya change karna chahte hain? Button select karein:</b>"
+        f"⚙️ <b>MANAGE RUNNING GIVEAWAY</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"╭ 🏷 <b>Title:</b> <b>{html.escape(title)}</b>\n"
+        f"├ 🏆 <b>Prize:</b> <b>{html.escape(prize)}</b>\n"
+        f"├ ⭐ <b>Referral Point:</b> <code>+{pts_per_ref} Points / Invite</code>\n"
+        f"├ 🟢 <b>Start Time:</b> <code>{html.escape(start_t)}</code>\n"
+        f"╰ 🔴 <b>End Time:</b> <code>{html.escape(end_t)}</code>\n\n"
+        f"👇 <b>Is giveaway me kya edit ya action lena hai?</b>"
     )
-    await callback.message.edit_text(text, reply_markup=edit_giveaway_kb(), parse_mode="HTML")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Edit Referral Points", callback_data=f"editgw_{gw_id}_points_per_ref"),
+         InlineKeyboardButton(text="🔴 Edit End Time", callback_data=f"editgw_{gw_id}_end_time")],
+        [InlineKeyboardButton(text="🟢 Edit Start Time", callback_data=f"editgw_{gw_id}_start_time"),
+         InlineKeyboardButton(text="🏆 Edit Prize", callback_data=f"editgw_{gw_id}_prize")],
+        [InlineKeyboardButton(text="🏷 Edit Title", callback_data=f"editgw_{gw_id}_title"),
+         InlineKeyboardButton(text="🔄 Reset Points (This GW)", callback_data=f"resetgw_{gw_id}")],
+        [InlineKeyboardButton(text="👑 Check & Announce Winner", callback_data=f"wingw_{gw_id}")],
+        [InlineKeyboardButton(text="🗑 Delete This Giveaway", callback_data=f"delgw_{gw_id}")],
+        [InlineKeyboardButton(text="🔙 Back to Admin Panel", callback_data="admin_home")]
+    ])
+    if is_edit:
+        await safe_edit(target, text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
-@dp.callback_query(F.data.startswith("editfield_"))
-async def cb_select_edit_field(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith("admin_manage_"))
+async def cb_admin_manage_gw(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("❌ Access Denied!", show_alert=True)
+    await state.clear()
+    gw_id = int(callback.data.split("_")[-1])
+    await callback.answer()
+    await render_admin_manage_gw(callback.message, gw_id, is_edit=True)
+
+# --- EDIT GIVEAWAY FIELDS (INCLUDING REFERRAL POINTS) ---
+@dp.callback_query(F.data.startswith("editgw_"))
+async def cb_edit_gw_field(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Access Denied!", show_alert=True)
 
-    field = callback.data.replace("editfield_", "")
-    field_labels = {
-        "end_time": "🔴 Naya End Time & Date (e.g., 10 Nov 2026, 11:00 PM)",
-        "start_time": "🟢 Naya Start Time & Date (e.g., 30 Oct 2026, 10:00 AM)",
-        "prize": "💎 Naya Prize (e.g., ₹1000 Cash + OTT Subscription)",
-        "title": "🏷 Naya Giveaway Title (e.g., Mega Referral Contest)"
+    parts = callback.data.split("_", 2)
+    gw_id = int(parts[1])
+    field = parts[2]
+
+    labels = {
+        "points_per_ref": "⭐ <b>Naya Referral Point</b> enter karein (Sirf Number likhein, jaise: <code>1</code>, <code>2</code>, <code>5</code>, <code>10</code>):",
+        "end_time": "🔴 <b>Naya End Time & Date</b> bhejein (e.g., <code>10 Nov 2026, 10:00 PM</code>):",
+        "start_time": "🟢 <b>Naya Start Time & Date</b> bhejein (e.g., <code>30 Oct 2026, 10:00 AM</code>):",
+        "prize": "🏆 <b>Naya Winning Prize</b> bhejein (e.g., <code>₹500 UPI Cash</code>):",
+        "title": "🏷 <b>Naya Giveaway Title</b> bhejein (e.g., <code>Mega Special Giveaway</code>):"
     }
 
-    await state.update_data(edit_field=field)
-    await state.set_state(EditGiveaway.new_value)
+    await state.update_data(gw_id=gw_id, field=field)
+    await state.set_state(EditGW.new_value)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Cancel Edit", callback_data="admin_edit_menu")]
+        [InlineKeyboardButton(text="❌ Cancel Edit", callback_data=f"admin_manage_{gw_id}")]
     ])
-    await callback.message.edit_text(
-        f"✏️ <b>UPDATE GIVEAWAY</b>\n\n"
-        f"Abhi type karke bhejein:\n<b>{field_labels.get(field, 'New Value')}</b>",
-        reply_markup=kb,
-        parse_mode="HTML"
+    await callback.answer()
+    await safe_edit(
+        callback.message,
+        f"✏️ <b>EDIT GIVEAWAY SETTING</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{labels.get(field, 'Nayi value bhejein:')}",
+        reply_markup=kb
     )
 
-@dp.message(EditGiveaway.new_value)
-async def process_edit_giveaway(message: Message, state: FSMContext):
+@dp.message(EditGW.new_value)
+async def step_save_edit_gw(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     data = await state.get_data()
-    field = data.get("edit_field")
-    new_val = message.text
+    gw_id = data["gw_id"]
+    field = data["field"]
+    val = message.text.strip()
 
-    allowed_columns = {"title": "title", "prize": "prize", "start_time": "start_time", "end_time": "end_time"}
-    col = allowed_columns.get(field)
+    if field == "points_per_ref":
+        if not val.isdigit() or int(val) <= 0:
+            return await message.answer("❌ <b>Invalid Number!</b> Kripya 1 ya usse bada number bhejein (e.g., <code>2</code>, <code>5</code>):", parse_mode="HTML")
+        val = int(val)
 
+    allowed = {"title": "title", "prize": "prize", "points_per_ref": "points_per_ref", "start_time": "start_time", "end_time": "end_time"}
+    col = allowed.get(field)
     if col:
         async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute(f"UPDATE giveaways SET {col} = ? WHERE is_active = 1", (new_val,))
+            await db.execute(f"UPDATE giveaways SET {col} = ? WHERE id = ?", (val, gw_id))
             await db.commit()
 
     await state.clear()
-    await message.answer(f"✅ <b>Giveaway successfully update ho gaya hai!</b>\nNayi value: <code>{html.escape(new_val)}</code>", parse_mode="HTML")
-    await render_admin_panel(message, is_edit=False)
+    await message.answer(f"✅ <b>Updated Successfully!</b>", parse_mode="HTML")
+    await render_admin_manage_gw(message, gw_id, is_edit=False)
 
-# --- STATS, DELETE, RESET & WINNER ---
-@dp.callback_query(F.data == "admin_stats")
-async def cb_admin_stats(callback: CallbackQuery):
+# --- DELETE, RESET, & WINNER FOR SPECIFIC GIVEAWAY ---
+@dp.callback_query(F.data.startswith("delgw_"))
+async def cb_delete_gw(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Access Denied!", show_alert=True)
+    gw_id = int(callback.data.split("_")[1])
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as c1:
-            total_users = (await c1.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM users WHERE is_member = 1") as c2:
-            active_members = (await c2.fetchone())[0]
-        async with db.execute("SELECT SUM(referrals_count) FROM users") as c3:
-            total_refs = (await c3.fetchone())[0] or 0
-
-    await callback.answer(
-        f"📊 LIVE BOT STATS\n\n"
-        f"👥 Total Bot Users: {total_users}\n"
-        f"✅ Channel Members: {active_members}\n"
-        f"🔗 Active Valid Referrals: {total_refs}",
-        show_alert=True
-    )
-
-@dp.callback_query(F.data == "admin_delete")
-async def cb_admin_delete(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return await callback.answer("❌ Access Denied!", show_alert=True)
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE giveaways SET is_active = 0 WHERE is_active = 1")
+        await db.execute("UPDATE giveaways SET is_active = 0 WHERE id = ?", (gw_id,))
         await db.commit()
-    await callback.answer("🗑 Current Running Giveaway Delete Kar Diya Gaya Hai!", show_alert=True)
-    await render_admin_panel(callback.message, is_edit=True)
+    await callback.answer("🗑 Giveaway Deleted Successfully!", show_alert=True)
+    await render_admin_home(callback.message, is_edit=True)
 
-@dp.callback_query(F.data == "admin_reset_pts")
-async def cb_admin_reset(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("resetgw_"))
+async def cb_reset_gw(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Access Denied!", show_alert=True)
+    gw_id = int(callback.data.split("_")[1])
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET points = 0, referrals_count = 0")
+        await db.execute("UPDATE participants SET points = 0, referrals_count = 0, rewarded = 0 WHERE giveaway_id = ?", (gw_id,))
         await db.commit()
-    await callback.answer("🔄 Sabhi users ke Points aur Referrals 0 par reset ho gaye hain!", show_alert=True)
-    await render_admin_panel(callback.message, is_edit=True)
+    await callback.answer("🔄 Is giveaway ke sabhi points 0 par reset ho gaye hain!", show_alert=True)
+    await render_admin_manage_gw(callback.message, gw_id, is_edit=True)
 
-@dp.callback_query(F.data == "admin_winner")
-async def cb_admin_winner(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("wingw_"))
+async def cb_winner_gw(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Access Denied!", show_alert=True)
-    gw = await get_active_giveaway()
+    gw_id = int(callback.data.split("_")[1])
+    gw = await get_giveaway(gw_id)
+
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
-            "SELECT user_id, full_name, username, points, referrals_count FROM users WHERE is_member = 1 ORDER BY points DESC, referrals_count DESC LIMIT 1"
+            """
+            SELECT p.user_id, u.full_name, u.username, p.points, p.referrals_count
+            FROM participants p
+            JOIN users u ON p.user_id = u.user_id
+            WHERE p.giveaway_id = ? AND u.is_member = 1 AND p.points > 0
+            ORDER BY p.points DESC, p.referrals_count DESC LIMIT 1
+            """,
+            (gw_id,)
         ) as cursor:
             winner = await cursor.fetchone()
 
-    if not winner or winner[3] == 0:
-        await callback.answer("❌ Abhi tak koi valid winner nahi hai!", show_alert=True)
-        return
+    if not winner:
+        return await callback.answer("❌ Is giveaway me abhi tak koi valid winner nahi hai!", show_alert=True)
 
     uid, name, uname, pts, refs = winner
     uname_str = f"@{uname}" if uname else f"<code>{uid}</code>"
-    gw_title = gw[1] if gw else "Giveaway"
-    gw_prize = gw[2] if gw else "Special Prize"
 
-    win_text = (
-        f"👑 <b>CURRENT #1 RANK WINNER</b> 👑\n\n"
-        f"🎁 <b>Giveaway:</b> <b>{html.escape(gw_title)}</b>\n"
-        f"💎 <b>Prize:</b> <b>{html.escape(gw_prize)}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🥇 <b>Winner Name:</b> {html.escape(name)}\n"
-        f"🆔 <b>Username / ID:</b> {uname_str} (<code>{uid}</code>)\n"
-        f"⭐ <b>Total Points:</b> <code>{pts} Points</code>\n"
-        f"👥 <b>Total Referrals:</b> <code>{refs} Friends</code>"
+    text = (
+        f"👑 <b>#1 RANK WINNER DETAILS</b> 👑\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎁 <b>Giveaway:</b> <b>{html.escape(gw[1])}</b>\n"
+        f"🏆 <b>Prize:</b> <b>{html.escape(gw[2])}</b>\n\n"
+        f"╭ 🥇 <b>Winner:</b> <b>{html.escape(name)}</b>\n"
+        f"├ 🆔 <b>User:</b> {uname_str} (<code>{uid}</code>)\n"
+        f"├ 💎 <b>Total Points:</b> <code>{pts} Points</code>\n"
+        f"╰ 👥 <b>Total Referrals:</b> <code>{refs} Friends</code>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Announce Winner to All Users", callback_data="admin_announce_win")],
-        [InlineKeyboardButton(text="⬅️ Back to Admin Panel", callback_data="admin_home")]
+        [InlineKeyboardButton(text="📢 Broadcast Winner to All Users", callback_data=f"annwin_{gw_id}")],
+        [InlineKeyboardButton(text="🔙 Back to Manage Giveaway", callback_data=f"admin_manage_{gw_id}")]
     ])
-    await callback.message.edit_text(win_text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+    await safe_edit(callback.message, text, reply_markup=kb)
 
-@dp.callback_query(F.data == "admin_announce_win")
-async def cb_announce_winner_all(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("annwin_"))
+async def cb_announce_winner(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Access Denied!", show_alert=True)
-    gw = await get_active_giveaway()
+    gw_id = int(callback.data.split("_")[1])
+    gw = await get_giveaway(gw_id)
+
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
-            "SELECT user_id, full_name, points, referrals_count FROM users WHERE is_member = 1 ORDER BY points DESC, referrals_count DESC LIMIT 1"
+            """
+            SELECT p.user_id, u.full_name, p.points, p.referrals_count
+            FROM participants p
+            JOIN users u ON p.user_id = u.user_id
+            WHERE p.giveaway_id = ? AND u.is_member = 1 AND p.points > 0
+            ORDER BY p.points DESC, p.referrals_count DESC LIMIT 1
+            """,
+            (gw_id,)
         ) as cursor:
             winner = await cursor.fetchone()
         async with db.execute("SELECT user_id FROM users") as c_all:
@@ -600,22 +774,19 @@ async def cb_announce_winner_all(callback: CallbackQuery):
         return await callback.answer("❌ Winner nahi mila!", show_alert=True)
 
     uid, name, pts, refs = winner
-    gw_title = gw[1] if gw else "Giveaway"
-    gw_prize = gw[2] if gw else "Special Prize"
-
-    announcement = (
-        f"🎉 <b>GIVEAWAY WINNER ANNOUNCEMENT!</b> 🎉\n\n"
-        f"🎁 <b>Giveaway:</b> <b>{html.escape(gw_title)}</b>\n"
-        f"💎 <b>Prize:</b> <b>{html.escape(gw_prize)}</b>\n\n"
-        f"👑 <b>WINNER:</b> <b>{html.escape(name)}</b>\n"
-        f"⭐ <b>Winning Score:</b> <code>{pts} Points ({refs} Referrals)</code>\n\n"
-        f"Congratulations! Agle giveaway ke liye <b>{CHANNEL_USERNAME}</b> par bane rahein!"
+    msg_text = (
+        f"🎊 <b>OFFICIAL GIVEAWAY WINNER!</b> 🎊\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎁 <b>Giveaway:</b> <b>{html.escape(gw[1])}</b>\n"
+        f"🏆 <b>Prize:</b> <b>{html.escape(gw[2])}</b>\n\n"
+        f"👑 <b>Winner:</b> <b>{html.escape(name)}</b>\n"
+        f"💎 <b>Score:</b> <code>{pts} Points ({refs} Referrals)</code>\n\n"
+        f"🔥 Congratulations! Agle giveaway me participate karne ke liye bot start karein!"
     )
-
     sent = 0
     for (u_id,) in all_users:
         try:
-            await bot.send_message(u_id, announcement, parse_mode="HTML")
+            await bot.send_message(u_id, msg_text, parse_mode="HTML")
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -623,79 +794,154 @@ async def cb_announce_winner_all(callback: CallbackQuery):
 
     await callback.answer(f"✅ Winner Announcement {sent} users ko bhej diya gaya hai!", show_alert=True)
 
-# --- CREATE GIVEAWAY FLOW (ADMIN ONLY) ---
+# --- CREATE NEW GIVEAWAY FLOW (WITH CUSTOM REFERRAL POINTS) ---
 @dp.callback_query(F.data == "admin_create")
 async def cb_admin_create(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Access Denied!", show_alert=True)
-    await state.set_state(CreateGiveaway.title)
+    await state.set_state(CreateGW.title)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="admin_home")]])
-    await callback.message.edit_text(
-        "➕ <b>CREATE NEW GIVEAWAY (Step 1/4)</b>\n\nGiveaway ka <b>Title</b> bhejein (e.g., <i>Mega Referral Giveaway</i>):",
+    await callback.answer()
+    await safe_edit(
+        callback.message,
+        "➕ <b>CREATE NEW GIVEAWAY (Step 1/5)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🏷 Giveaway ka <b>Title (Naam)</b> bhejein:\n"
+        "<i>(Example: Netflix 4K Giveaway)</i>",
+        reply_markup=kb
+    )
+
+@dp.message(CreateGW.title)
+async def step_gw_title(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.update_data(title=message.text.strip())
+    await state.set_state(CreateGW.prize)
+    await message.answer(
+        "🏆 <b>Step 2/5: Winning Prize</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Giveaway ka <b>Prize</b> bhejein:\n"
+        "<i>(Example: ₹500 UPI Cash / 1 Month Premium)</i>",
+        parse_mode="HTML"
+    )
+
+@dp.message(CreateGW.prize)
+async def step_gw_prize(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.update_data(prize=message.text.strip())
+    await state.set_state(CreateGW.points_per_ref)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ 1 Point", callback_data="setpts_1"),
+         InlineKeyboardButton(text="⭐ 2 Points", callback_data="setpts_2")],
+        [InlineKeyboardButton(text="⭐ 5 Points", callback_data="setpts_5"),
+         InlineKeyboardButton(text="⭐ 10 Points", callback_data="setpts_10")]
+    ])
+    await message.answer(
+        "⭐ <b>Step 3/5: Set Referral Points</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "1 Friend ko refer karne par <b>kitne Points</b> milne chahiye?\n\n"
+        "👇 <i>Neeche button select karein ya koi bhi number (jaise 3, 15, 50) type karke bhejein:</i>",
         reply_markup=kb,
         parse_mode="HTML"
     )
 
-@dp.message(CreateGiveaway.title)
-async def step_gw_title(message: Message, state: FSMContext):
+@dp.callback_query(CreateGW.points_per_ref, F.data.startswith("setpts_"))
+async def cb_set_ref_pts(callback: CallbackQuery, state: FSMContext):
+    pts = int(callback.data.split("_")[1])
+    await state.update_data(points_per_ref=pts)
+    await state.set_state(CreateGW.start_time)
+    await callback.answer(f"✅ +{pts} Points Per Referral Set!")
+    await safe_edit(
+        callback.message,
+        f"🟢 <b>Step 4/5: Start Time & Date</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⭐ <b>Selected Referral Points:</b> <code>+{pts} Points</code>\n\n"
+        f"Ab Giveaway ka <b>Start Time</b> bhejein:\n"
+        f"<i>(Example: 30 Oct 2026, 10:00 AM)</i>"
+    )
+
+@dp.message(CreateGW.points_per_ref)
+async def step_gw_pts_text(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    await state.update_data(title=message.text)
-    await state.set_state(CreateGiveaway.prize)
+    if not message.text.strip().isdigit() or int(message.text.strip()) <= 0:
+        return await message.answer("❌ <b>Sirf number bhejein!</b> (Jaise: <code>1</code>, <code>2</code>, <code>5</code>):", parse_mode="HTML")
+    pts = int(message.text.strip())
+    await state.update_data(points_per_ref=pts)
+    await state.set_state(CreateGW.start_time)
     await message.answer(
-        "💎 <b>Step 2/4:</b> Giveaway ka <b>Prize</b> bhejein (e.g., <i>₹500 UPI Cash + Premium Pass</i>):",
+        f"🟢 <b>Step 4/5: Start Time & Date</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⭐ <b>Selected Referral Points:</b> <code>+{pts} Points</code>\n\n"
+        f"Ab Giveaway ka <b>Start Time</b> bhejein:\n"
+        f"<i>(Example: 30 Oct 2026, 10:00 AM)</i>",
         parse_mode="HTML"
     )
 
-@dp.message(CreateGiveaway.prize)
-async def step_gw_prize(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await state.update_data(prize=message.text)
-    await state.set_state(CreateGiveaway.start_time)
-    await message.answer(
-        "🟢 <b>Step 3/4:</b> Giveaway ka <b>Start Time & Date</b> bhejein (e.g., <i>30 Oct 2026, 10:00 AM</i>):",
-        parse_mode="HTML"
-    )
-
-@dp.message(CreateGiveaway.start_time)
+@dp.message(CreateGW.start_time)
 async def step_gw_start(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    await state.update_data(start_time=message.text)
-    await state.set_state(CreateGiveaway.end_time)
+    await state.update_data(start_time=message.text.strip())
+    await state.set_state(CreateGW.end_time)
     await message.answer(
-        "🔴 <b>Step 4/4:</b> Giveaway ka <b>End Time & Date</b> bhejein (e.g., <i>05 Nov 2026, 10:00 PM</i>):",
+        "🔴 <b>Step 5/5: End Time & Date</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Giveaway kab khatam hoga? <b>End Time</b> bhejein:\n"
+        "<i>(Example: 05 Nov 2026, 10:00 PM)</i>",
         parse_mode="HTML"
     )
 
-@dp.message(CreateGiveaway.end_time)
+@dp.message(CreateGW.end_time)
 async def step_gw_end(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     data = await state.get_data()
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE giveaways SET is_active = 0 WHERE is_active = 1")
         await db.execute(
-            "INSERT INTO giveaways (title, prize, start_time, end_time, is_active) VALUES (?, ?, ?, ?, 1)",
-            (data["title"], data["prize"], data["start_time"], message.text)
+            "INSERT INTO giveaways (title, prize, points_per_ref, start_time, end_time, is_active) VALUES (?, ?, ?, ?, ?, 1)",
+            (data["title"], data["prize"], data["points_per_ref"], data["start_time"], message.text.strip())
         )
         await db.commit()
     await state.clear()
-    await message.answer("✅ <b>New Giveaway Successfully Created & Live!</b>", parse_mode="HTML")
-    await render_admin_panel(message, is_edit=False)
+    await message.answer("🎉 <b>New Giveaway Created & Added to Home Screen Buttons!</b>", parse_mode="HTML")
+    await render_admin_home(message, is_edit=False)
 
-# --- BROADCAST FLOW (ADMIN ONLY) ---
+# --- BOT STATS & BROADCAST ---
+@dp.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("❌ Access Denied!", show_alert=True)
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as c1:
+            total_u = (await c1.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM users WHERE is_member = 1") as c2:
+            active_u = (await c2.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM giveaways WHERE is_active = 1") as c3:
+            active_gw = (await c3.fetchone())[0]
+
+    await callback.answer(
+        f"📊 LIVE BOT STATISTICS\n\n"
+        f"👥 Total Users: {total_u}\n"
+        f"✅ Verified Members: {active_u}\n"
+        f"🎁 Active Giveaways: {active_gw}",
+        show_alert=True
+    )
+
 @dp.callback_query(F.data == "admin_broadcast")
 async def cb_admin_broadcast(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Access Denied!", show_alert=True)
     await state.set_state(BroadcastState.message)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="admin_home")]])
-    await callback.message.edit_text(
-        "📢 <b>BROADCAST MESSAGE</b>\n\nJo message aap sabhi users ko bhejna chahte hain (Text, Photo, ya Video), wo abhi send karein:",
-        reply_markup=kb,
-        parse_mode="HTML"
+    await callback.answer()
+    await safe_edit(
+        callback.message,
+        "📢 <b>BROADCAST MESSAGE</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Jo message, photo, ya video sabhi users ko bhejna hai wo abhi send karein:",
+        reply_markup=kb
     )
 
 @dp.message(BroadcastState.message)
@@ -708,7 +954,7 @@ async def process_broadcast(message: Message, state: FSMContext):
             users = await cursor.fetchall()
 
     sent, failed = 0, 0
-    status_msg = await message.answer(f"⏳ <b>Broadcasting to {len(users)} users...</b>", parse_mode="HTML")
+    status_msg = await message.answer(f"⏳ <b>Sending to {len(users)} users...</b>", parse_mode="HTML")
     for (uid,) in users:
         try:
             await message.copy_to(chat_id=uid)
@@ -718,17 +964,16 @@ async def process_broadcast(message: Message, state: FSMContext):
             failed += 1
 
     await status_msg.edit_text(
-        f"✅ <b>BROADCAST COMPLETED!</b>\n\n"
-        f"🟢 <b>Delivered:</b> <code>{sent}</code>\n"
-        f"🔴 <b>Failed/Blocked:</b> <code>{failed}</code>",
+        f"✅ <b>BROADCAST COMPLETED!</b>\n"
+        f"🟢 <b>Sent:</b> <code>{sent}</code>  |  🔴 <b>Failed:</b> <code>{failed}</code>",
         parse_mode="HTML"
     )
-    await render_admin_panel(message, is_edit=False)
+    await render_admin_home(message, is_edit=False)
 
 # --- MAIN ENTRYPOINT ---
 async def main():
     await init_db()
-    print("🚀 @Leongiveawaybot is now LIVE and polling...")
+    print("🚀 @Leongiveawaybot V2 is LIVE and polling...")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query", "chat_member"])
 
 if __name__ == "__main__":
